@@ -67,7 +67,7 @@ class Strategy:
 
         dipped = close * BPS <= self.first_close * (BPS - DIP_BPS)
         if dipped or (not self.ever_traded and state.seq >= FALLBACK_BAR):
-            return self._buy(close)
+            return self._buy(state, close)
         return []
 
     def _sell(self, state):
@@ -76,7 +76,7 @@ class Strategy:
         return [{"side": "sell", "symbol": self.symbol, "qty": state.positions[0]["qty"],
                  "max_slippage_bps": MAX_SLIPPAGE_BPS}]
 
-    def _buy(self, close):
+    def _buy(self, state, close):
         self.entry_close = close
         self.peak_close = close
         self.ever_traded = True
