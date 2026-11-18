@@ -73,7 +73,8 @@ class Strategy:
     def _sell(self, state):
         self.entry_close = 0
         self.peak_close = 0
-        return [{"side": "sell", "symbol": self.symbol, "qty": state.positions[0]["qty"],
+        held = state.positions.get(self.symbol)
+        return [{"side": "sell", "symbol": self.symbol, "qty": held.qty,
                  "max_slippage_bps": MAX_SLIPPAGE_BPS}]
 
     def _buy(self, state, close):
