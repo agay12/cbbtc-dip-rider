@@ -1,17 +1,22 @@
-"""cbBTC dip-rider: buy-the-dip entry, crash stop, trailing profit.
+"""cbBTC deep-dip rider: buy a big drawdown, ride the bounce with a tight trail.
 
 Strategy (all decisions from bar closes, no clock, deterministic):
-- Before entering: wait up to DIP_WAIT_BARS bars for a pullback of at least
-  DIP_BPS below the first close seen, then buy with all cash (the dip gives a
-  better entry than buying the first bar outright). If no dip arrives within
-  DIP_WAIT_BARS bars, buy anyway (stay long, like the market drifts).
-- While long: hold, but two exits protect equity:
-  * crash stop: close fell STOP_BPS below entry close -> sell, then re-enter
-    once the close recovers within 100 bps of the recent rolling max;
-  * trailing profit: after the close ran TRAIL_ARM_BPS above entry, a pullback
-    of TRAIL_BPS from the running peak sells and stays in cash.
+- Anchor on the first close seen after warm-up.
+- Deep-dip entry: when the close falls at least DIP_BPS below the first close,
+  buy with all available cash (capped by max_weight). A 2.5% drawdown in a
+  single 24h window is a large, rare move; bounces off it pay far more than the
+  ~26 bps full round-trip cost (4 bps fee + 4 bps pool fee + 2 bps slippage +
+  constant-product impact).
+- Exits while long (whichever comes first):
+  * take profit: close runs TAKE_BPS above the entry close;
+  * trailing stop: close falls TRAIL_BPS from the running peak close since entry.
+  After an exit the same dip condition can re-trigger, so the bot re-rides
+  further bounces.
+- Fallback: if no deep dip arrived by FALLBACK_BAR, buy once anyway and hold
+  with the same exits, so the bot is never flat for the whole window.
+
 Everything is integer math on the protocol's u64 decimal strings; orders carry
-a generous max_slippage_bps so the fills are never refused for slippage.
+a generous max_slippage_bps so fills are never refused for slippage.
 """
 
 import os
@@ -20,12 +25,10 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
 import makefun_bars
 
-DIP_BPS = 60
-DIP_WAIT_BARS = 12
-STOP_BPS = 2000
-TRAIL_ARM_BPS = 300
-TRAIL_BPS = 150
-REENTRY_WINDOW_BARS = 240  # bars kept for the re-entry watch (~4 hours)
+DIP_BPS = 250        # close at least this far below the first close -> buy
+TAKE_BPS = 250       # close this far above the entry close -> sell
+TRAIL_BPS = 100      # close this far below the peak close since entry -> sell
+FALLBACK_BAR = 480   # if no dip by this batch index, buy once anyway
 MAX_SLIPPAGE_BPS = 10_000
 
 BPS = 10_000
@@ -36,9 +39,7 @@ class Strategy:
         self.first_close = None
         self.entry_close = 0
         self.peak_close = 0
-        self.stopped = False
-        self.started = False
-        self.recent = []  # closes since re-entry watch began
+        self.ever_traded = False
         self.symbol = None
 
     def on_batch(self, state, batch):
@@ -58,49 +59,35 @@ class Strategy:
 
         if state.positions:
             self.peak_close = max(self.peak_close, close)
-            if close * BPS < self.entry_close * (BPS - STOP_BPS):
-                self.stopped = True
-                self.entry_close = 0
-                self.peak_close = 0
-                self.recent = []
-                return [{"side": "sell", "symbol": self.symbol, "qty": state.positions[0]["qty"], "max_slippage_bps": MAX_SLIPPAGE_BPS}]
-            if self.peak_close * BPS > self.entry_close * (BPS + TRAIL_ARM_BPS) and close * BPS < self.peak_close * (BPS - TRAIL_BPS):
-                self.entry_close = 0
-                self.peak_close = 0
-                return [{"side": "sell", "symbol": self.symbol, "qty": state.positions[0]["qty"], "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+            if close * BPS >= self.entry_close * (BPS + TAKE_BPS):
+                return self._sell(state)
+            if close * BPS <= self.peak_close * (BPS - TRAIL_BPS):
+                return self._sell(state)
             return []
 
-        if self.stopped:
-            self.recent.append(close)
-            if len(self.recent) > REENTRY_WINDOW_BARS:
-                self.recent.pop(0)
-            if close * BPS >= max(self.recent) * (BPS - 100):
-                self.stopped = False
-                return self._buy(state, close)
-            return []
-
-        if not self.started:
-            if close * BPS <= self.first_close * (BPS - DIP_BPS):
-                self.started = True
-                return self._buy(state, close)
-            if state.seq >= DIP_WAIT_BARS:
-                self.started = True
-                return self._buy(state, close)
-            return []
-
+        dipped = close * BPS <= self.first_close * (BPS - DIP_BPS)
+        if dipped or (not self.ever_traded and state.seq >= FALLBACK_BAR):
+            return self._buy(close)
         return []
 
-    def _buy(self, state, close):
+    def _sell(self, state):
+        self.entry_close = 0
+        self.peak_close = 0
+        return [{"side": "sell", "symbol": self.symbol, "qty": state.positions[0]["qty"],
+                 "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+
+    def _buy(self, close):
         self.entry_close = close
         self.peak_close = close
-        self.recent = []
+        self.ever_traded = True
         cash = state.cash
         eq = state.equity
         cap = (state.hello["caps"]["max_weight_bps"] * eq) // BPS
         amount = cash if cash < cap else cap
         if amount < int(state.hello["fees"]["min_notional_quote_units"]):
             return []
-        return [{"side": "buy", "symbol": self.symbol, "notional_quote_units": amount, "max_slippage_bps": MAX_SLIPPAGE_BPS}]
+        return [{"side": "buy", "symbol": self.symbol, "notional_quote_units": amount,
+                 "max_slippage_bps": MAX_SLIPPAGE_BPS}]
 
 
 def main():
